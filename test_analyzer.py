@@ -192,9 +192,9 @@ class TestConflictDetection:
         }) as tmp:
             result = analyze(str(tmp))
             assert result["total_conflicts"] == 1
-            # Should list all 3 mods under the conflict
             key = (0x025C5F1A, 0, 0x99)
-            assert len(result["conflicts"][key]) == 3
+            assert len(result["conflicts"][key]["mods"]) == 3
+            assert result["conflicts"][key]["intentional"] is False
 
     def test_multiple_conflicts_across_different_types(self):
         mod1 = make_dbpf_v2([
@@ -255,7 +255,7 @@ class TestLagAnalysis:
             "sub2/SomeMod.package": mod,
         }) as tmp:
             result = analyze(str(tmp))
-            assert len(result["duplicate_files"]) >= 1
+            assert len(result["duplicate_names"]) >= 1
 
     def test_top_mods_by_resource_count(self):
         mod1 = make_dbpf_v2([(0x025C5F1A, 0, i, i * 8, 8) for i in range(100)])
@@ -325,11 +325,20 @@ class TestPrintReport:
             "total_scripts": 0,
             "total_entries": 0,
             "total_conflicts": 0,
+            "total_intentional": 0,
             "conflicts": {},
+            "type_counts": {},
             "mod_resource_counts": {},
             "large_files": [],
             "script_mods": [],
-            "duplicate_files": [],
+            "duplicate_names": [],
+            "duplicate_content": [],
+            "deep_scripts": [],
+            "corrupt_archives": [],
+            "wrong_python": [],
+            "onedrive": False,
+            "deprecated_files": [],
+            "elapsed": 0.01,
         }
         print_report(result)
         captured = capsys.readouterr()
@@ -343,16 +352,28 @@ class TestPrintReport:
             "total_scripts": 0,
             "total_entries": 2,
             "total_conflicts": 1,
+            "total_intentional": 0,
             "conflicts": {
-                (0x025C5F1A, 0, 0x42): [
-                    (Path("mod1.package"), 0),
-                    (Path("mod2.package"), 0),
-                ]
+                (0x025C5F1A, 0, 0x42): {
+                    "mods": [(Path("mod1.package"), 0), (Path("mod2.package"), 0)],
+                    "intentional": False,
+                    "type": 0x025C5F1A,
+                    "group": 0,
+                    "instance": 0x42,
+                }
             },
+            "type_counts": {0x025C5F1A: 2},
             "mod_resource_counts": {"mod1.package": 1, "mod2.package": 1},
             "large_files": [],
             "script_mods": [],
-            "duplicate_files": [],
+            "duplicate_names": [],
+            "duplicate_content": [],
+            "deep_scripts": [],
+            "corrupt_archives": [],
+            "wrong_python": [],
+            "onedrive": False,
+            "deprecated_files": [],
+            "elapsed": 0.01,
         }
         print_report(result)
         captured = capsys.readouterr()
@@ -368,11 +389,20 @@ class TestPrintReport:
             "total_scripts": 0,
             "total_entries": 1,
             "total_conflicts": 0,
+            "total_intentional": 0,
             "conflicts": {},
+            "type_counts": {},
             "mod_resource_counts": {"big.package": 1},
             "large_files": [(Path("big.package"), 30 * 1024 * 1024)],
             "script_mods": [],
-            "duplicate_files": [],
+            "duplicate_names": [],
+            "duplicate_content": [],
+            "deep_scripts": [],
+            "corrupt_archives": [],
+            "wrong_python": [],
+            "onedrive": False,
+            "deprecated_files": [],
+            "elapsed": 0.01,
         }
         print_report(result)
         captured = capsys.readouterr()
@@ -389,11 +419,20 @@ class TestPrintReport:
                 "total_scripts": 1,
                 "total_entries": 0,
                 "total_conflicts": 0,
+                "total_intentional": 0,
                 "conflicts": {},
+                "type_counts": {},
                 "mod_resource_counts": {},
                 "large_files": [],
                 "script_mods": [script],
-                "duplicate_files": [],
+                "duplicate_names": [],
+                "duplicate_content": [],
+                "deep_scripts": [],
+                "corrupt_archives": [],
+                "wrong_python": [],
+                "onedrive": False,
+                "deprecated_files": [],
+                "elapsed": 0.01,
             }
             print_report(result)
             captured = capsys.readouterr()
@@ -455,3 +494,8 @@ class TestEdgeCases:
             assert isinstance(key[0], int)
             assert isinstance(key[1], int)
             assert isinstance(key[2], int)
+            # Check nested dict structure
+            c = result["conflicts"][key]
+            assert "mods" in c
+            assert "intentional" in c
+            assert len(c["mods"]) == 2
