@@ -8,7 +8,6 @@
 
 Scan Sims 4 Mods folder for resource conflicts, lag sources, and mod health issues.
 
-Ported features from [TwistedMexi's BetterExceptions](https://github.com/vojust/sim4debug/tree/main/for).
 
 ## Features
 

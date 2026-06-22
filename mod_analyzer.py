@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sims 4 Mod Analyzer — BetterExceptions Edition
+Sims 4 Mod Analyzer
 Scans Mods folder for conflicts, lag sources, mod health, and generates reports.
 """
 
@@ -492,7 +492,7 @@ def print_report(r: AnalysisResult, color: bool = False):
     total_mods = r.total_packages + r.total_scripts
     sep = _c(_CYAN, "━" * 60, color)
 
-    print(f"\n  {_c(_BOLD, 'Sims 4 Mod Analyzer — BE Edition', color)}")
+    print(f"\n  {_c(_BOLD, 'Sims 4 Mod Analyzer', color)}")
     print(f"  Папка: {r.mods_path}")
     print(f"  Время: {r.elapsed:.1f}s")
     print(sep)
