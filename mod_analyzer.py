@@ -227,6 +227,11 @@ class WalkResult:
     total_files: int = 0
 
 
+DEPRECATED_EXTS = (".zip", ".rar", ".7z", ".py")
+TEMP_EXTS = (".temp", ".tmp", ".part", ".crdownload", ".downloading")
+SYSTEM_FILES = (".ds_store", "thumbs.db", "desktop.ini")
+
+
 def walk_mods(mods_path: Path, large_threshold: int = 20 * 1024 ** 2,
               max_depth: int = 5, progress=None) -> WalkResult:
     wr = WalkResult()
@@ -238,17 +243,16 @@ def walk_mods(mods_path: Path, large_threshold: int = 20 * 1024 ** 2,
             rel_root = root_p
 
         for fn in sorted(files):
-            wr.total_files += 1
-            fp = root_p / fn
-            try:
-                rel = fp.relative_to(mods_path)
-            except ValueError:
-                rel = fp
-            depth = len(rel.parents) - 1
             fn_lower = fn.lower()
+            if fn_lower in SYSTEM_FILES or fn.startswith("."):
+                continue
+
+            wr.total_files += 1
+            rel = rel_root / fn
+            depth = len(rel.parents) - 1
 
             if fn_lower.endswith(".package"):
-                pi = read_package(fp, rel)
+                pi = read_package(root_p / fn, rel)
                 wr.packages.append(pi)
                 if pi.size > large_threshold:
                     wr.large_files.append((rel, pi.size))
@@ -256,19 +260,20 @@ def walk_mods(mods_path: Path, large_threshold: int = 20 * 1024 ** 2,
                     wr.deep_packages.append((rel, depth))
 
             elif fn_lower.endswith(".ts4script"):
-                wr.scripts.append(fp)
-                if fp.stat().st_size > large_threshold:
-                    wr.large_files.append((rel, fp.stat().st_size))
+                wr.scripts.append(root_p / fn)
+                sz = (root_p / fn).stat().st_size
+                if sz > large_threshold:
+                    wr.large_files.append((rel, sz))
                 if depth > 1:
                     wr.deep_scripts.append((rel, depth))
 
-            elif any(fn_lower.endswith(e) for e in (".zip", ".rar", ".7z", ".py")):
+            elif fn_lower.endswith(DEPRECATED_EXTS):
                 wr.deprecated.append(rel)
 
-            elif any(fn_lower.endswith(e) for e in (".temp", ".tmp", ".part", ".crdownload", ".downloading")):
+            elif fn_lower.endswith(TEMP_EXTS):
                 wr.temp_files.append(rel)
 
-            if progress:
+            if progress and wr.total_files % 500 == 0:
                 progress(wr.total_files)
 
     wr.large_files.sort(key=lambda x: -x[1])
@@ -874,8 +879,7 @@ def main():
         _progress = None
         if not args.json:
             def _progress(n: int):
-                if n > 0 and n % 1000 == 0:
-                    print(f"\r  🔍 Scanning... {n} files", end="", flush=True)
+                print(f"\r  🔍 Scanning... {n} files", end="", flush=True)
 
         result = analyze(str(path), large_mb=args.large, max_depth=args.max_depth,
                          progress=_progress)
