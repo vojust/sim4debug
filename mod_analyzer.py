@@ -813,7 +813,7 @@ def print_report(result: dict):
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main():
-    VERSION = "v20260622.1238"
+    VERSION = "v26.622.1238"
     html_output = False
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
