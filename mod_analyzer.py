@@ -2,29 +2,27 @@
 """
 Sims 4 Mod Analyzer — BetterExceptions Edition
 Scans Mods folder for conflicts, lag sources, mod health, and generates reports.
-
-Ported features from TwistedMexi's BetterExceptions:
-  - Conflict Scanner (resource TGI clashes, intentional overrides)
-  - Package Manager (deep DBPF parsing)
-  - Analysis (OneDrive, script depth, corrupt archives, outdated mods)
-  - Patch Scanner readiness
-  - Diff checker
-  - HTML report
 """
 
+import argparse
 import hashlib
+import json
 import os
 import struct
 import sys
 import time
 import zipfile
 from collections import defaultdict
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from xml.etree import ElementTree
+from typing import Optional
 
-# ── DBPF resource types ──────────────────────────────────────────────
-KNOWN_TYPES = {
+# ── Constants ───────────────────────────────────────────────────────
+
+VERSION = "v26.622.1238"
+
+DBPF_TYPES = {
     0x025C5F1A: "Tuning (XML)",
     0x03536A8B: "String Table (STBL)",
     0x042B5B94: "Script (Python)",
@@ -84,74 +82,117 @@ KNOWN_TYPES = {
     0x534C5A6D: "Event",
 }
 
-# Script mods with known issues / special handling
-KNOWN_SCRIPT_MODS = {
-    "tmex", "twistedmexi",
-    "mc_command", "mccommand", "deaderpool",
-    "wickedwhims", "wicked_whims", "turbodriver",
-    "basemental", "basementaldrugs",
-    "lumpinou", "lumpinous",
-    "littlemssam",
-    "scumbumbo",
-    "zerbu",
-    "kawaiistacie",
-    "sacrificial",
-    "bienchen",
-    "ravasheen",
-    "pandasama",
-    "simrealist",
-    "adeepindigo",
+PYTHON_MAGIC = {
+    3360: "3.6", 3393: "3.6", 3394: "3.6.5+",
+    3420: "3.7", 3421: "3.7", 3422: "3.7.2+", 3423: "3.7.3+",
+    3424: "3.7.4+", 3425: "3.7.5+",
+    3430: "3.8", 3431: "3.8", 3432: "3.8.2+", 3433: "3.8.3+",
+    3456: "3.9", 3457: "3.9",
+    3470: "3.10", 3471: "3.10",
 }
+
+# Known problematic mod combinations (from BE / community knowledge)
+PROBLEM_PAIRS: list[tuple[set[str], str]] = [
+    ({"basemental", "wickedwhims"}, "Basemental + WickedWhims могут конфликтовать при одновременной загрузке"),
+    ({"mc_command", "ui_cheats"}, "MC Command Center + UI Cheats могут вызывать конфликты кнопок"),
+    ({"tmex", "betterbuildbuy"}, "Вы используете несколько модов TwistedMexi — проверьте совместимость версий"),
+]
+
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+_RED = "\033[91m"
+_GREEN = "\033[92m"
+_YELLOW = "\033[93m"
+_CYAN = "\033[96m"
+
+
+def _c(code: str, text: str, use_color: bool) -> str:
+    return f"{code}{text}{_RESET}" if use_color else text
 
 
 def _type_name(tid: int) -> str:
-    return KNOWN_TYPES.get(tid, f"0x{tid:08X}")
+    return DBPF_TYPES.get(tid, f"0x{tid:08X}")
 
 
-def _mod_creator(path: Path) -> str:
-    name = path.stem.lower().replace("_", "").replace("-", "").replace(" ", "")
-    for creator in KNOWN_SCRIPT_MODS:
-        if creator in name:
-            return creator
+def _file_size_fmt(size: int) -> str:
+    if size > 1024 ** 3:
+        return f"{size / (1024**3):.2f} GB"
+    if size > 1024 ** 2:
+        return f"{size / (1024**2):.1f} MB"
+    if size > 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"
+
+
+def _file_hash(path: Path) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(65536), b""):
+                h.update(block)
+        return h.hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def _mod_creator(name: str) -> str:
+    KNOWN = {
+        "tmex", "twistedmexi", "mc_command", "mccommand", "deaderpool",
+        "wickedwhims", "simrealist", "pandasama", "lumpinou",
+        "littlemssam", "scumbumbo", "zerbu", "sacrificial",
+        "basemental", "bienchen", "ravasheen", "adeepindigo", "kawaiistacie",
+    }
+    stem = Path(name).stem.lower().replace("_", "").replace("-", "").replace(" ", "")
+    for c in KNOWN:
+        if c in stem:
+            return c
     return ""
-
-
-def _file_hash(path: Path, blocksize: int = 65536) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(blocksize), b""):
-            h.update(block)
-    return h.hexdigest()[:16]
 
 
 # ── DBPF parser ─────────────────────────────────────────────────────
 
-def read_package_index(path: Path) -> list[dict]:
-    """Parse DBPF v2.0 package file and return resource index entries."""
-    entries = []
+@dataclass
+class ResourceEntry:
+    type: int
+    group: int
+    instance: int
+    offset: int
+    size: int
+
+
+@dataclass
+class PackageInfo:
+    path: Path
+    rel: Path
+    dbpf_version: int
+    entries: list[ResourceEntry]
+    size: int
+    error: Optional[str] = None
+
+
+def read_package(path: Path, rel: Path) -> PackageInfo:
     try:
         with open(path, "rb") as f:
             magic = f.read(4)
             if magic != b"DBPF":
-                return entries
+                return PackageInfo(path, rel, 0, [], path.stat().st_size,
+                                   error="Not a DBPF file")
 
             ver = struct.unpack("<I", f.read(4))[0]
-            f.read(4)
-            f.read(4)
-            f.read(8)
+            f.read(4); f.read(4); f.read(8)
             index_major = struct.unpack("<I", f.read(4))[0]
             index_count = struct.unpack("<I", f.read(4))[0]
             index_offset = struct.unpack("<I", f.read(4))[0]
             index_size = struct.unpack("<I", f.read(4))[0]
 
             if index_count == 0 or index_offset == 0:
-                return entries
+                return PackageInfo(path, rel, ver, [], path.stat().st_size)
 
-            if index_count > 0 and index_size > 0:
-                entry_size = index_size // index_count
-            else:
-                entry_size = 24
-
+            entry_size = (index_size // index_count) if index_count > 0 and index_size > 0 else 24
+            entries = []
             f.seek(index_offset)
             for _ in range(index_count):
                 raw = f.read(entry_size)
@@ -160,65 +201,116 @@ def read_package_index(path: Path) -> list[dict]:
                 if entry_size == 24:
                     typ, grp, inst, off, sz = struct.unpack("<IIQII", raw)
                 elif entry_size == 20:
-                    typ, grp, inst_lo, inst_hi, off = struct.unpack("<IIIHH", raw)
-                    inst = (inst_hi << 32) | inst_lo
+                    typ, grp, inst_l, inst_h, off = struct.unpack("<IIIHH", raw)
+                    inst = (inst_h << 32) | inst_l
                     sz = 0
                 else:
                     continue
+                entries.append(ResourceEntry(typ, grp, inst, off, sz))
 
-                entries.append({
-                    "type": typ,
-                    "group": grp,
-                    "instance": inst,
-                    "offset": off,
-                    "size": sz,
-                })
-    except (OSError, struct.error):
-        pass
-    return entries
+            return PackageInfo(path, rel, ver, entries, path.stat().st_size)
+    except (OSError, struct.error) as e:
+        return PackageInfo(path, rel, 0, [], path.stat().st_size, error=str(e))
 
 
-# ── Scanning helpers ────────────────────────────────────────────────
+# ── Scanner ─────────────────────────────────────────────────────────
 
-_MOD_CACHE: dict[str, list[dict]] = {}
+@dataclass
+class WalkResult:
+    packages: list[PackageInfo] = field(default_factory=list)
+    scripts: list[Path] = field(default_factory=list)
+    large_files: list[tuple[Path, int]] = field(default_factory=list)
+    deep_scripts: list[tuple[Path, int]] = field(default_factory=list)
+    deep_packages: list[tuple[Path, int]] = field(default_factory=list)
+    deprecated: list[Path] = field(default_factory=list)
+    temp_files: list[Path] = field(default_factory=list)
+    total_files: int = 0
 
 
-def _scan_packages(mods_path: Path) -> list[tuple[Path, list[dict]]]:
-    results = []
-    for fp in sorted(mods_path.rglob("*.package")):
+def walk_mods(mods_path: Path, large_threshold: int = 20 * 1024 ** 2,
+              max_depth: int = 5, progress=None) -> WalkResult:
+    wr = WalkResult()
+    for root, dirs, files in os.walk(mods_path):
+        root_p = Path(root)
         try:
-            rel = fp.relative_to(mods_path)
+            rel_root = root_p.relative_to(mods_path)
         except ValueError:
-            rel = fp
-        key = str(fp.resolve())
-        if key not in _MOD_CACHE:
-            _MOD_CACHE[key] = read_package_index(fp)
-        results.append((rel, _MOD_CACHE[key]))
-    return results
+            rel_root = root_p
+
+        for fn in sorted(files):
+            wr.total_files += 1
+            fp = root_p / fn
+            try:
+                rel = fp.relative_to(mods_path)
+            except ValueError:
+                rel = fp
+            depth = len(rel.parents) - 1
+            fn_lower = fn.lower()
+
+            if fn_lower.endswith(".package"):
+                pi = read_package(fp, rel)
+                wr.packages.append(pi)
+                if pi.size > large_threshold:
+                    wr.large_files.append((rel, pi.size))
+                if depth > max_depth:
+                    wr.deep_packages.append((rel, depth))
+
+            elif fn_lower.endswith(".ts4script"):
+                wr.scripts.append(fp)
+                if fp.stat().st_size > large_threshold:
+                    wr.large_files.append((rel, fp.stat().st_size))
+                if depth > 1:
+                    wr.deep_scripts.append((rel, depth))
+
+            elif any(fn_lower.endswith(e) for e in (".zip", ".rar", ".7z", ".py")):
+                wr.deprecated.append(rel)
+
+            elif any(fn_lower.endswith(e) for e in (".temp", ".tmp", ".part", ".crdownload", ".downloading")):
+                wr.temp_files.append(rel)
+
+            if progress:
+                progress(wr.total_files)
+
+    wr.large_files.sort(key=lambda x: -x[1])
+    return wr
 
 
-def _find_script_mods(mods_path: Path) -> list[Path]:
-    return sorted(mods_path.rglob("*.ts4script"))
+# ── Analysis ────────────────────────────────────────────────────────
+
+@dataclass
+class AnalysisResult:
+    mods_path: str
+    total_files: int = 0
+    total_packages: int = 0
+    total_scripts: int = 0
+    total_entries: int = 0
+    total_conflicts: int = 0
+    total_intentional: int = 0
+    elapsed: float = 0.0
+    dbpf_v1_packages: list[Path] = field(default_factory=list)
+    packages_with_errors: list[PackageInfo] = field(default_factory=list)
+    conflicts: dict = field(default_factory=dict)
+    type_counts: dict[int, int] = field(default_factory=dict)
+    mod_resource_counts: dict[str, int] = field(default_factory=dict)
+    mod_resource_sizes: dict[str, int] = field(default_factory=dict)
+    large_files: list = field(default_factory=list)
+    script_mods: list[Path] = field(default_factory=list)
+    duplicate_names: list[Path] = field(default_factory=list)
+    duplicate_content: list[tuple] = field(default_factory=list)
+    deep_scripts: list[tuple] = field(default_factory=list)
+    deep_packages: list[tuple] = field(default_factory=list)
+    corrupt_archives: list[Path] = field(default_factory=list)
+    wrong_python: list[tuple] = field(default_factory=list)
+    onedrive: bool = False
+    deprecated_files: list[Path] = field(default_factory=list)
+    temp_files: list[Path] = field(default_factory=list)
+    problem_pairs: list[tuple] = field(default_factory=list)
 
 
-def _find_large_files(mods_path: Path, threshold_mb: float = 20.0) -> list[tuple[Path, int]]:
-    big = []
-    for ext in ("*.package", "*.ts4script"):
-        for fp in mods_path.rglob(ext):
-            sz = fp.stat().st_size
-            if sz > threshold_mb * 1024 * 1024:
-                try:
-                    rel = fp.relative_to(mods_path)
-                except ValueError:
-                    rel = fp
-                big.append((rel, sz))
-    return sorted(big, key=lambda x: -x[1])
-
-
-def _find_dup_names(mods_path: Path) -> list[Path]:
+def _find_dup_names(packages: list[PackageInfo]) -> list[Path]:
     seen: dict[str, list[Path]] = defaultdict(list)
-    for fp in mods_path.rglob("*.package"):
-        seen[fp.name.lower()].append(fp)
+    for pi in packages:
+        seen[pi.rel.name.lower()].append(pi.rel)
     dupes = []
     for name, files in seen.items():
         if len(files) > 1:
@@ -226,67 +318,44 @@ def _find_dup_names(mods_path: Path) -> list[Path]:
     return dupes
 
 
-def _find_dup_content(mods_path: Path) -> list[tuple[Path, Path]]:
+def _find_dup_content(packages: list[PackageInfo], scripts: list[Path]) -> list[tuple]:
+    size_map: dict[int, list[Path]] = defaultdict(list)
+    for pi in packages:
+        size_map[pi.size].append(pi.path)
+    for sp in scripts:
+        sz = sp.stat().st_size
+        size_map[sz].append(sp)
+
     hashes: dict[str, Path] = {}
     pairs = []
-    for ext in ("*.package", "*.ts4script"):
-        for fp in sorted(mods_path.rglob(ext)):
-            h = _file_hash(fp)
-            if h in hashes:
-                pairs.append((hashes[h], fp))
-            else:
-                hashes[h] = fp
+    for sz, paths in size_map.items():
+        if len(paths) < 2:
+            continue
+        for p in paths:
+            h = _file_hash(p)
+            if h:
+                if h in hashes:
+                    pairs.append((hashes[h], p))
+                else:
+                    hashes[h] = p
     return pairs
 
 
-def _check_script_depth(mods_path: Path) -> list[tuple[Path, int]]:
-    deep = []
-    for fp in mods_path.rglob("*.ts4script"):
-        try:
-            rel = fp.relative_to(mods_path)
-        except ValueError:
-            continue
-        depth = len(rel.parents) - 1
-        if depth > 1:
-            deep.append((rel, depth))
-    return deep
-
-
-def _check_corrupt_archives(mods_path: Path) -> list[Path]:
+def _check_corrupt(scripts: list[Path]) -> list[Path]:
     bad = []
-    for fp in sorted(mods_path.rglob("*.ts4script")):
+    for fp in scripts:
         try:
             with zipfile.ZipFile(fp) as z:
-                bad_file = z.testzip()
-                if bad_file:
+                if z.testzip():
                     bad.append(fp)
         except (zipfile.BadZipFile, OSError):
             bad.append(fp)
     return bad
 
 
-def _check_wrong_python_version(mods_path: Path) -> list[tuple[Path, str]]:
+def _check_python_version(scripts: list[Path]) -> list[tuple]:
     flagged = []
-    PYTHON_MAGIC = {
-        3360: "3.6",   # Python 3.6
-        3393: "3.6",   # Python 3.6.4+
-        3394: "3.6.5+",
-        3420: "3.7",   # Python 3.7
-        3421: "3.7",
-        3422: "3.7.2+",
-        3423: "3.7.3+",
-        3424: "3.7.4+",
-        3425: "3.7.5+",
-        3430: "3.8",   # Python 3.8
-        3431: "3.8",
-        3432: "3.8.2+",
-        3433: "3.8.3+",
-        3456: "3.9",   # Python 3.9
-        3457: "3.9",
-        3470: "3.10",  # Python 3.10
-        3471: "3.10",
-    }
-    for fp in sorted(mods_path.rglob("*.ts4script")):
+    for fp in scripts:
         try:
             with zipfile.ZipFile(fp) as z:
                 for name in z.namelist():
@@ -297,169 +366,312 @@ def _check_wrong_python_version(mods_path: Path) -> list[tuple[Path, str]]:
                             if magic in PYTHON_MAGIC:
                                 pyver = PYTHON_MAGIC[magic]
                                 if pyver != "3.7":
-                                    try:
-                                        rel = fp.relative_to(mods_path)
-                                    except ValueError:
-                                        rel = fp
-                                    flagged.append((rel, f"Python {pyver} (needs 3.7)"))
+                                    flagged.append((Path(name), f"Python {pyver}"))
                                     break
         except (zipfile.BadZipFile, OSError, struct.error):
             pass
     return flagged
 
 
-def _check_onedrive(mods_path: Path) -> bool:
-    path_str = str(mods_path).lower()
-    return "onedrive" in path_str
+def _check_problem_pairs(script_names: list[str]) -> list[tuple]:
+    found_sets = set()
+    for sn in script_names:
+        stem = Path(sn).stem.lower()
+        for known, _ in PROBLEM_PAIRS:
+            for k in known:
+                if k in stem.replace("_", "").replace("-", ""):
+                    found_sets.add(k)
+
+    results = []
+    for pair, desc in PROBLEM_PAIRS:
+        if pair.issubset(found_sets):
+            results.append((pair, desc))
+    return results
 
 
-def _check_deprecated_file_types(mods_path: Path) -> list[Path]:
-    bad = []
-    for ext in ("*.zip", "*.rar", "*.7z", "*.py"):
-        for fp in mods_path.rglob(ext):
-            bad.append(fp)
-    return bad
-
-
-# ── Diff checker (ported from BE diff_match_patch) ─────────────────
-
-def _diff_texts(text1: str, text2: str) -> list[tuple[str, str]]:
-    diffs = []
-    i = j = 0
-    while i < len(text1) and j < len(text2):
-        if text1[i] == text2[j]:
-            i += 1
-            j += 1
-        else:
-            i_start = i
-            j_start = j
-            while i < len(text1) and j < len(text2) and text1[i] != text2[j]:
-                i += 1
-                j += 1
-            if i > i_start:
-                diffs.append(("-", text1[i_start:i]))
-            if j > j_start:
-                diffs.append(("+", text2[j_start:j]))
-    if i < len(text1):
-        diffs.append(("-", text1[i:]))
-    if j < len(text2):
-        diffs.append(("+", text2[j:]))
-    return diffs
-
-
-# ── Main analysis ───────────────────────────────────────────────────
-
-def analyze(mods_path_str: str) -> dict:
-    """Run full analysis and return structured results."""
+def analyze(mods_path_str: str, large_mb: float = 20, max_depth: int = 5,
+            progress=None) -> AnalysisResult:
     start = time.time()
     mods_path = Path(mods_path_str).expanduser().resolve()
 
     if not mods_path.is_dir():
-        return {"error": f"Папка не найдена: {mods_path}"}
+        return AnalysisResult(mods_path=mods_path_str, elapsed=0)
 
-    # Scan phase
-    packages = _scan_packages(mods_path)
-    script_mods = _find_script_mods(mods_path)
-    large_files = _find_large_files(mods_path)
-    dup_names = _find_dup_names(mods_path)
-    dup_content = _find_dup_content(mods_path)
-    deep_scripts = _check_script_depth(mods_path)
-    corrupt = _check_corrupt_archives(mods_path)
-    wrong_python = _check_wrong_python_version(mods_path)
-    onedrive = _check_onedrive(mods_path)
-    deprecated = _check_deprecated_file_types(mods_path)
+    wr = walk_mods(mods_path, large_threshold=int(large_mb * 1024 ** 2),
+                   max_depth=max_depth, progress=progress)
 
-    # Resource conflict detection
-    resource_map: dict[tuple[int, int, int], list[tuple[Path, int, str]]] = defaultdict(list)
-    for rel, entries in packages:
-        creator = _mod_creator(rel)
-        for idx, e in enumerate(entries):
-            key = (e["type"], e["group"], e["instance"])
-            resource_map[key].append((rel, idx, creator))
+    packages = wr.packages
+    scripts = wr.scripts
 
-    raw_conflicts = {k: v for k, v in resource_map.items() if len(v) > 1}
+    # Conflict detection
+    resource_map: dict[tuple[int, int, int], list[tuple[Path, str]]] = defaultdict(list)
+    for pi in packages:
+        creator = _mod_creator(str(pi.rel))
+        for e in pi.entries:
+            key = (e.type, e.group, e.instance)
+            resource_map[key].append((pi.rel, creator))
 
-    # Annotate conflicts: intentional override if all mods share a creator prefix
+    raw = {k: v for k, v in resource_map.items() if len(v) > 1}
     conflicts = {}
-    for key, mods in raw_conflicts.items():
-        creators = {m[2] for m in mods if m[2]}
+    for key, mods in raw.items():
+        creators = {m[1] for m in mods if m[1]}
         intentional = len(creators) == 1 and "" not in creators
-        conflicts[key] = {
-            "mods": [(m[0], m[1]) for m in mods],
+        conflicts[f"0x{key[0]:X}:{key[1]}:{key[2]:X}"] = {
+            "type": key[0], "group": key[1], "instance": key[2],
+            "mods": [str(m[0]) for m in mods],
             "intentional": intentional,
-            "type": key[0],
-            "group": key[1],
-            "instance": key[2],
         }
 
-    # Resource type stats
+    # Aggregations
     type_counts: dict[int, int] = defaultdict(int)
-    for rel, entries in packages:
-        for e in entries:
-            type_counts[e["type"]] += 1
+    mod_entries: dict[str, int] = defaultdict(int)
+    mod_sizes: dict[str, int] = defaultdict(int)
+    for pi in packages:
+        key = str(pi.rel)
+        mod_entries[key] = len(pi.entries)
+        for e in pi.entries:
+            type_counts[e.type] += 1
+            mod_sizes[key] += e.size
 
-    # Mod resource counts
-    mod_resource_counts = {str(rel): len(entries) for rel, entries in packages}
+    # Dupes
+    dup_names = _find_dup_names(packages)
+    dup_content = _find_dup_content(packages, scripts)
+    corrupt = _check_corrupt(scripts)
+    wrong_py = _check_python_version(scripts)
 
-    # Stats
-    total_packages = len(packages)
-    total_scripts = len(script_mods)
-    total_entries = sum(len(e) for _, e in packages)
-    total_conflicts = len(conflicts)
-    total_intentional = sum(1 for c in conflicts.values() if c["intentional"])
+    # Problem pairs
+    script_names = [str(s.relative_to(mods_path) if s.is_relative_to(mods_path) else s)
+                    for s in scripts]
+    problem_pairs = _check_problem_pairs(script_names)
+
+    # DBPF v1
+    dbpf_v1 = [pi.rel for pi in packages if pi.dbpf_version == 1]
+
+    # Packages with errors
+    pkg_errors = [pi for pi in packages if pi.error]
 
     elapsed = time.time() - start
 
-    return {
-        "mods_path": str(mods_path),
-        "total_packages": total_packages,
-        "total_scripts": total_scripts,
-        "total_entries": total_entries,
-        "total_conflicts": total_conflicts,
-        "total_intentional": total_intentional,
-        "conflicts": conflicts,
-        "type_counts": dict(type_counts),
-        "mod_resource_counts": mod_resource_counts,
-        "large_files": large_files,
-        "script_mods": script_mods,
-        "duplicate_names": dup_names,
-        "duplicate_content": dup_content,
-        "deep_scripts": deep_scripts,
-        "corrupt_archives": corrupt,
-        "wrong_python": wrong_python,
-        "onedrive": onedrive,
-        "deprecated_files": deprecated,
-        "elapsed": elapsed,
-    }
+    return AnalysisResult(
+        mods_path=str(mods_path),
+        total_files=wr.total_files,
+        total_packages=len(packages),
+        total_scripts=len(scripts),
+        total_entries=sum(len(pi.entries) for pi in packages),
+        total_conflicts=len(conflicts),
+        total_intentional=sum(1 for c in conflicts.values() if c["intentional"]),
+        elapsed=elapsed,
+        dbpf_v1_packages=dbpf_v1,
+        packages_with_errors=pkg_errors,
+        conflicts=conflicts,
+        type_counts=dict(type_counts),
+        mod_resource_counts=dict(mod_entries),
+        mod_resource_sizes=dict(mod_sizes),
+        large_files=wr.large_files,
+        script_mods=scripts,
+        duplicate_names=dup_names,
+        duplicate_content=dup_content,
+        deep_scripts=wr.deep_scripts,
+        deep_packages=wr.deep_packages,
+        corrupt_archives=corrupt,
+        wrong_python=wrong_py,
+        onedrive="onedrive" in str(mods_path).lower(),
+        deprecated_files=wr.deprecated,
+        temp_files=wr.temp_files,
+        problem_pairs=problem_pairs,
+    )
+
+
+# ── Text report ─────────────────────────────────────────────────────
+
+def print_report(r: AnalysisResult, color: bool = False):
+    if not r.mods_path or not Path(r.mods_path).exists():
+        print(_c(_RED, f"\n  [ОШИБКА] Папка не найдена: {r.mods_path}", color))
+        return
+
+    total_mods = r.total_packages + r.total_scripts
+    sep = _c(_CYAN, "━" * 60, color)
+
+    print(f"\n  {_c(_BOLD, 'Sims 4 Mod Analyzer — BE Edition', color)}")
+    print(f"  Папка: {r.mods_path}")
+    print(f"  Время: {r.elapsed:.1f}s")
+    print(sep)
+
+    print(f"\n  {_c(_BOLD, '📊 ОБЗОР', color)}")
+    print(f"  Файлов всего:    {r.total_files}")
+    print(f"  📦 Пакетов:       {r.total_packages}")
+    print(f"  📜 Скрипт-модов:  {r.total_scripts}")
+    print(f"  🧩 Ресурсов:      {r.total_entries:,}")
+    print(f"  ⚠️  Конфликтов:   {r.total_conflicts}"
+          + (f"  (intentional: {r.total_intentional})" if r.total_intentional else ""))
+
+    # Health
+    health: list[tuple[str, str, str]] = []
+    if r.onedrive:
+        health.append(("danger", "OneDrive", "OneDrive может восстанавливать удалённые моды"))
+    if r.deep_scripts:
+        health.append(("danger", "Скрипты глубоко", f"{len(r.deep_scripts)} скриптов не загрузятся"))
+    if r.deep_packages:
+        health.append(("warning", "Пакеты глубоко", f"{len(r.deep_packages)} пакетов >5 папок"))
+    if r.corrupt_archives:
+        health.append(("danger", "Повреждённые", f"{len(r.corrupt_archives)} .ts4script"))
+    if r.wrong_python:
+        health.append(("warning", "Python версия", f"{len(r.wrong_python)} скриптов не для 3.7"))
+    if r.deprecated_files:
+        health.append(("warning", "Не те типы", f"{len(r.deprecated_files)} .zip/.rar/.py"))
+    if r.temp_files:
+        health.append(("warning", "Временные", f"{len(r.temp_files)} .temp/.part"))
+    if r.duplicate_content:
+        health.append(("warning", "Дубликаты", f"{len(r.duplicate_content)} пар по содержимому"))
+    if r.dbpf_v1_packages:
+        health.append(("danger", "DBPF v1", f"{len(r.dbpf_v1_packages)} от Sims 2/3"))
+    if r.packages_with_errors:
+        health.append(("danger", "Ошибки", f"{len(r.packages_with_errors)} пакетов с ошибками"))
+
+    if health:
+        print(f"\n  {_c(_BOLD, '🔍 ЗДОРОВЬЕ МОДОВ', color)}")
+        print(sep)
+        for level, title, desc in health:
+            badge = _c(_RED if level == "danger" else _YELLOW, f"● {title}", color)
+            print(f"  {badge}  {desc}")
+
+    # Conflicts
+    if r.conflicts:
+        print(f"\n  {_c(_BOLD, f'⚠️  КОНФЛИКТЫ РЕСУРСОВ ({r.total_conflicts})', color)}")
+        print(sep)
+        by_type: dict[int, list] = defaultdict(list)
+        for c in r.conflicts.values():
+            by_type[c["type"]].append(c)
+        for tid in sorted(by_type.keys()):
+            items = by_type[tid]
+            print(f"\n    [{_type_name(tid)}] — {len(items)} конфликт(ов)")
+            for c in items[:5]:
+                files_str = ", ".join(c["mods"])
+                intent = _c(_GREEN, " (intentional)", color) if c.get("intentional") else ""
+                print(f"      Instance 0x{c['instance']:016X} → {files_str}{intent}")
+            if len(items) > 5:
+                print(f"      ... и ещё {len(items) - 5}")
+    else:
+        print(f"\n  ✅ Конфликтов не найдено")
+
+    # Problem pairs
+    if r.problem_pairs:
+        print(f"\n  {_c(_BOLD, '⚠️  ИЗВЕСТНЫЕ ПРОБЛЕМНЫЕ КОМБИНАЦИИ', color)}")
+        print(sep)
+        for pair, desc in r.problem_pairs:
+            print(f"    {', '.join(pair)} → {desc}")
+
+    # Large files
+    if r.large_files:
+        print(f"\n  {_c(_BOLD, '🐘 БОЛЬШИЕ ФАЙЛЫ', color)}")
+        print(sep)
+        for rel, sz in r.large_files[:10]:
+            print(f"    {_file_size_fmt(sz):>10}  {rel}")
+    else:
+        print(f"\n  ✅ Больших файлов нет")
+
+    # Scripts
+    if r.script_mods:
+        print(f"\n  {_c(_BOLD, f'📜 СКРИПТ-МОДЫ ({len(r.script_mods)})', color)}")
+        print(sep)
+        for sp in r.script_mods[:10]:
+            try:
+                rel = sp.relative_to(Path(r.mods_path))
+            except ValueError:
+                rel = sp
+            print(f"    {_file_size_fmt(sp.stat().st_size):>10}  {rel}")
+    else:
+        print(f"\n  ✅ Скрипт-модов нет")
+
+    # Deep scripts
+    if r.deep_scripts:
+        print(f"\n  {_c(_RED, '❌ СКРИПТЫ НЕ ЗАГРУЗЯТСЯ (>1 ПАПКА)', color)}")
+        for rel, depth in r.deep_scripts:
+            print(f"    [depth {depth}] {rel}")
+
+    # Deep packages
+    if r.deep_packages:
+        print(f"\n  {_c(_YELLOW, '⚠️  ПАКЕТЫ ГЛУБОКО (>5 ПАПОК)', color)}")
+        for rel, depth in r.deep_packages[:5]:
+            print(f"    [depth {depth}] {rel}")
+
+    # Dupes
+    if r.duplicate_names:
+        print(f"\n  🔁 ДУБЛИКАТЫ ИМЁН")
+        for fp in r.duplicate_names[:5]:
+            print(f"    {fp}")
+    if r.duplicate_content:
+        print(f"\n  🔁 ДУБЛИКАТЫ ПО СОДЕРЖИМОМУ")
+        for a, b in r.duplicate_content[:3]:
+            try:
+                ra = a.relative_to(Path(r.mods_path))
+            except ValueError:
+                ra = a
+            try:
+                rb = b.relative_to(Path(r.mods_path))
+            except ValueError:
+                rb = b
+            print(f"    {ra} == {rb}")
+
+    # Wrong Python
+    if r.wrong_python:
+        print(f"\n  {_c(_YELLOW, '⚠️  НЕПРАВИЛЬНАЯ ВЕРСИЯ PYTHON', color)}")
+        for rel, ver in r.wrong_python[:5]:
+            print(f"    {ver}  {rel}")
+
+    # Top mods by resources
+    if r.mod_resource_counts:
+        print(f"\n  {_c(_BOLD, '🏋️  ТОП-10 ПО РЕСУРСАМ', color)}")
+        print(sep)
+        for rel, count in sorted(r.mod_resource_counts.items(), key=lambda x: -x[1])[:10]:
+            sz = r.mod_resource_sizes.get(rel, 0)
+            print(f"    {count:6,d} ресурсов  {_file_size_fmt(sz):>10}  {rel}")
+
+    # Resource type distribution
+    if r.type_counts:
+        print(f"\n  {_c(_BOLD, '📊 ТИПЫ РЕСУРСОВ', color)}")
+        print(sep)
+        for tid, count in sorted(r.type_counts.items(), key=lambda x: -x[1])[:10]:
+            print(f"    {count:8,d}  {_type_name(tid)}")
+
+    print(f"\n{sep}")
+    print(f"  Анализ завершён.")
+    print(f"{sep}\n")
 
 
 # ── HTML report ─────────────────────────────────────────────────────
 
-def _html_report(result: dict) -> str:
+def _html_report(r: AnalysisResult) -> str:
     styles = """
     <style>
+      *{box-sizing:border-box;margin:0;padding:0}
       body{font-family:Arial,sans-serif;color:#333;background:#f5f5f5;margin:20px}
-      .header{background:#4a4a6a;color:#fff;padding:20px;border-radius:8px 8px 0 0}
-      .header h1{margin:0;font-size:28px}
-      .header .meta{font-size:14px;opacity:.8}
-      .section{margin:20px 0;background:#fff;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1)}
-      .section h2{padding:15px 20px;margin:0;background:#e8e8f0;border-radius:8px 8px 0 0;font-size:18px}
-      .section .content{padding:15px 20px}
+      .header{background:linear-gradient(135deg,#4a4a6a,#6a4a8a);color:#fff;padding:25px 30px;border-radius:10px 10px 0 0}
+      .header h1{margin:0;font-size:26px}
+      .header .meta{font-size:13px;opacity:.8;margin-top:5px}
+      .section{margin:18px 0;background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+      .section h2{padding:14px 20px;margin:0;background:#e8e8f0;border-radius:8px 8px 0 0;font-size:17px;cursor:default}
+      .section .content{padding:12px 20px 16px}
       table{width:100%;border-collapse:collapse}
-      th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #eee;font-size:13px}
-      th{background:#f0f0f5;font-weight:600}
-      .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
-      .badge-danger{background:#ffe0e0;color:#c00}
-      .badge-warning{background:#fff3d6;color:#a60}
-      .badge-success{background:#dff0df;color:#060}
-      .badge-info{background:#d6ecff;color:#069}
-      .collapsible{cursor:pointer;background:#f9f9fb;padding:10px 15px;border:none;text-align:left;width:100%;font-size:14px;font-weight:600;border-bottom:1px solid #eee}
+      th,td{padding:7px 12px;text-align:left;border-bottom:1px solid #eee;font-size:13px}
+      th{background:#f4f4f8;font-weight:600}
+      .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600}
+      .danger{background:#ffe0e0;color:#c00}
+      .warning{background:#fff3d6;color:#a60}
+      .success{background:#dff0df;color:#060}
+      .info{background:#d6ecff;color:#069}
+      .collapsible{background:#f8f8fa;cursor:pointer;padding:10px 18px;width:100%;border:none;text-align:left;font-size:14px;font-weight:600;border-bottom:1px solid #e8e8f0;outline:none}
       .collapsible:hover{background:#eeeef5}
-      .collapsible:after{content:"\\25BC";float:right;font-size:12px}
-      .collapsible.active:after{content:"\\25B2"}
-      .coll-content{padding:10px 20px;display:none}
-      .intentional{color:#080;font-style:italic}
-      .footer{text-align:center;font-size:11px;color:#999;padding:20px}
+      .collapsible:after{content:"\\25BC";float:right;font-size:11px;color:#888}
+      .active:after{content:"\\25B2"}
+      .coll-content{padding:0;display:none;overflow:hidden}
+      .coll-content table{margin:0}
+      .intentional{color:#080;font-style:italic;font-size:12px}
+      .footer{text-align:center;font-size:11px;color:#aaa;padding:20px}
+      .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+      .stat-card{background:#fafafe;border:1px solid #e8e8f0;border-radius:6px;padding:14px;text-align:center}
+      .stat-card .num{font-size:28px;font-weight:700;color:#4a4a6a}
+      .stat-card .label{font-size:12px;color:#888;margin-top:4px}
     </style>
     <script>
       document.addEventListener('click',function(e){
@@ -472,398 +684,229 @@ def _html_report(result: dict) -> str:
     </script>
     """
 
-    mods_path = result["mods_path"]
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    total_mods = result["total_packages"] + result["total_scripts"]
 
-    html = f"""<!DOCTYPE html>
+    h = f"""<!DOCTYPE html>
 <html lang="ru">
-<head><meta charset="utf-8"><title>Sims 4 Mod Analysis Report</title>{styles}</head>
+<head><meta charset="utf-8"><title>Sims 4 Mod Analysis — {r.mods_path}</title>{styles}</head>
 <body>
 <div class="header">
-  <h1>Sims 4 Mod Analysis Report</h1>
-  <div class="meta">{mods_path} | {ts} | {result["elapsed"]:.1f}s</div>
+  <h1>Sims 4 Mod Analysis</h1>
+  <div class="meta">{r.mods_path} &nbsp;|&nbsp; {ts} &nbsp;|&nbsp; {r.elapsed:.1f}s</div>
 </div>
-"""
-
-    # Overview
-    html += """
 <div class="section">
   <h2>Overview</h2>
   <div class="content">
-    <table>
-      <tr><th>Metric</th><th>Value</th></tr>
-      <tr><td>Total mod files</td><td><b>%d</b></td></tr>
-      <tr><td>Package files</td><td><b>%d</b></td></tr>
-      <tr><td>Script mods</td><td><b>%d</b></td></tr>
-      <tr><td>Total resources</td><td><b>%d</b></td></tr>
-      <tr><td>Resource conflicts</td><td><b>%d</b></td></tr>
-      <tr><td>Intentional overrides</td><td><b>%d</b></td></tr>
-      <tr><td>Large files ({%d} MB+)</td><td><b>%d</b></td></tr>
-      <tr><td>Scan duration</td><td>%.1f seconds</td></tr>
-    </table>
+    <div class="grid">
+      <div class="stat-card"><div class="num">{r.total_packages + r.total_scripts}</div><div class="label">Mod Files</div></div>
+      <div class="stat-card"><div class="num">{r.total_packages}</div><div class="label">.package</div></div>
+      <div class="stat-card"><div class="num">{r.total_scripts}</div><div class="label">.ts4script</div></div>
+      <div class="stat-card"><div class="num">{r.total_entries:,}</div><div class="label">Resources</div></div>
+      <div class="stat-card"><div class="num">{r.total_conflicts}</div><div class="label">Conflicts</div></div>
+      <div class="stat-card"><div class="num">{len(r.large_files)}</div><div class="label">Large Files</div></div>
+    </div>
   </div>
-</div>
-""" % (total_mods, result["total_packages"], result["total_scripts"],
-       result["total_entries"], result["total_conflicts"],
-       result["total_intentional"], 20, len(result["large_files"]),
-       result["elapsed"])
+</div>"""
 
-    # Health checks
-    health_items = []
-    if result["onedrive"]:
-        health_items.append((
-            "OneDrive Detected",
-            "danger",
-            "OneDrive может восстанавливать удалённые моды. Рекомендуется отключить его."
-        ))
-    if result["deep_scripts"]:
-        health_items.append((
-            "Scripts Too Deep",
-            "danger",
-            f"{len(result['deep_scripts'])} скрипт-модов лежат глубже 1 папки. Sims 4 не загружает скрипты из подпапок."
-        ))
-    if result["corrupt_archives"]:
-        health_items.append((
-            "Corrupt Scripts",
-            "danger",
-            f"{len(result['corrupt_archives'])} .ts4script файлов повреждены или не являются zip-архивами."
-        ))
-    if result["wrong_python"]:
-        health_items.append((
-            "Wrong Python Version",
-            "warning",
-            f"{len(result['wrong_python'])} скриптов скомпилированы для неправильной версии Python."
-        ))
-    if result["deprecated_files"]:
-        health_items.append((
-            "Deprecated File Types",
-            "warning",
-            f"{len(result['deprecated_files'])} файлов (.zip/.rar/.py) не должны быть в Mods."
-        ))
-    if result["duplicate_content"]:
-        health_items.append((
-            "Duplicate Content",
-            "warning",
-            f"{len(result['duplicate_content'])} пар файлов имеют одинаковое содержимое."
-        ))
+    # Health
+    health = []
+    for title, level, desc in [
+        ("OneDrive", "danger" if r.onedrive else None, "Папка в OneDrive"),
+        ("Scripts Too Deep", "danger" if r.deep_scripts else None, ""),
+        ("Packages Too Deep", "warning" if r.deep_packages else None, ""),
+        ("Corrupt Scripts", "danger" if r.corrupt_archives else None, ""),
+        ("Wrong Python", "warning" if r.wrong_python else None, ""),
+        ("Deprecated Extensions", "warning" if r.deprecated_files else None, ""),
+        ("Temp Files", "warning" if r.temp_files else None, ""),
+        ("DBPF v1", "danger" if r.dbpf_v1_packages else None, ""),
+        ("Package Errors", "danger" if r.packages_with_errors else None, ""),
+        ("Duplicate Content", "warning" if r.duplicate_content else None, ""),
+    ]:
+        if level:
+            n = {"Scripts Too Deep": len(r.deep_scripts),
+                 "Packages Too Deep": len(r.deep_packages),
+                 "Corrupt Scripts": len(r.corrupt_archives),
+                 "Wrong Python": len(r.wrong_python),
+                 "Deprecated Extensions": len(r.deprecated_files),
+                 "Temp Files": len(r.temp_files),
+                 "DBPF v1": len(r.dbpf_v1_packages),
+                 "Package Errors": len(r.packages_with_errors),
+                 "Duplicate Content": len(r.duplicate_content),
+                 "OneDrive": 1}.get(title, 0)
+            health.append(f'<span class="badge {level}">{title}: {n}</span>')
 
-    if health_items:
-        html += '<div class="section"><h2>Mod Health</h2><div class="content">'
-        for title, level, desc in health_items:
-            html += f'<p><span class="badge badge-{level}">{title}</span> {desc}</p>'
-        html += "</div></div>"
+    if health:
+        h += f'<div class="section"><h2>Mod Health</h2><div class="content">{" ".join(health)}</div></div>'
 
     # Conflicts
-    if result["conflicts"]:
-        html += '<div class="section"><h2>Resource Conflicts (%d)</h2>' % result["total_conflicts"]
+    if r.conflicts:
+        h += f'<div class="section"><h2>Resource Conflicts ({r.total_conflicts})</h2>'
         by_type: dict[int, list] = defaultdict(list)
-        for c in result["conflicts"].values():
+        for c in r.conflicts.values():
             by_type[c["type"]].append(c)
-
         for tid in sorted(by_type.keys()):
             items = by_type[tid]
-            tname = _type_name(tid)
-            html += f'<button class="collapsible">[{tname}] — {len(items)} conflict(s)</button>'
-            html += '<div class="coll-content"><table><tr><th>Instance</th><th>Files</th></tr>'
-            for c in items[:10]:
-                files_str = ", ".join(str(m[0]) for m in c["mods"])
-                label = ""
-                if c.get("intentional"):
-                    label = ' <span class="intentional">(intentional override)</span>'
-                html += f"<tr><td>0x{c['instance']:016X}</td><td>{files_str}{label}</td></tr>"
-            if len(items) > 10:
-                html += f"<tr><td colspan='2'>... and {len(items) - 10} more</td></tr>"
-            html += "</table></div>"
-        html += "</div>"
+            h += f'<button class="collapsible">[{_type_name(tid)}] — {len(items)} conflict(s)</button>'
+            h += '<div class="coll-content"><table><tr><th>Instance</th><th>Files</th></tr>'
+            for c in items[:20]:
+                label = ' <span class="intentional">(intentional)</span>' if c.get("intentional") else ""
+                h += f"<tr><td>0x{c['instance']:016X}</td><td>{', '.join(c['mods'])}{label}</td></tr>"
+            if len(items) > 20:
+                h += f"<tr><td colspan='2'>... and {len(items) - 20} more</td></tr>"
+            h += "</table></div>"
+        h += "</div>"
+
+    # Problem pairs
+    if r.problem_pairs:
+        h += '<div class="section"><h2>Problematic Mod Combinations</h2><div class="content">'
+        for pair, desc in r.problem_pairs:
+            h += f"<p><span class='badge danger'>{', '.join(pair)}</span> {desc}</p>"
+        h += "</div></div>"
+
+    # Error packages
+    if r.packages_with_errors:
+        h += '<div class="section"><h2>Package Errors</h2><div class="content"><table><tr><th>File</th><th>Error</th></tr>'
+        for pi in r.packages_with_errors:
+            h += f"<tr><td>{pi.rel}</td><td>{pi.error}</td></tr>"
+        h += "</table></div></div>"
 
     # Large files
-    if result["large_files"]:
-        html += '<div class="section"><h2>Large Files ({} MB+)</h2><div class="content"><table><tr><th>Size</th><th>File</th></tr>'.format(20)
-        for rel, sz in result["large_files"][:10]:
-            mb = sz / (1024 * 1024)
-            html += f"<tr><td>{mb:.1f} MB</td><td>{rel}</td></tr>"
-        if len(result["large_files"]) > 10:
-            html += f"<tr><td colspan='2'>... and {len(result['large_files']) - 10} more</td></tr>"
-        html += "</table></div></div>"
+    if r.large_files:
+        h += '<div class="section"><h2>Large Files</h2><div class="content"><table><tr><th>Size</th><th>File</th></tr>'
+        for rel, sz in r.large_files[:20]:
+            h += f"<tr><td>{_file_size_fmt(sz)}</td><td>{rel}</td></tr>"
+        h += "</table></div></div>"
 
-    # Script mods
-    if result["script_mods"]:
-        html += '<div class="section"><h2>Script Mods (%d)</h2><div class="content"><table><tr><th>Size</th><th>File</th></tr>' % len(result["script_mods"])
-        for sp in result["script_mods"][:15]:
+    # Scripts
+    if r.script_mods:
+        h += f'<div class="section"><h2>Script Mods ({len(r.script_mods)})</h2><div class="content"><table><tr><th>Size</th><th>File</th></tr>'
+        for sp in sorted(r.script_mods, key=lambda x: -x.stat().st_size)[:20]:
             try:
-                rel = sp.relative_to(Path(result["mods_path"]))
+                rel = sp.relative_to(Path(r.mods_path))
             except ValueError:
                 rel = sp
-            kb = sp.stat().st_size / 1024
-            html += f"<tr><td>{kb:.1f} KB</td><td>{rel}</td></tr>"
-        if len(result["script_mods"]) > 15:
-            html += f"<tr><td colspan='2'>... and {len(result['script_mods']) - 15} more</td></tr>"
-        html += "</table></div></div>"
+            h += f"<tr><td>{_file_size_fmt(sp.stat().st_size)}</td><td>{rel}</td></tr>"
+        h += "</table></div></div>"
+
+    # Deep scripts
+    if r.deep_scripts:
+        h += '<div class="section"><h2>Scripts Too Deep (WILL NOT LOAD)</h2><div class="content">'
+        for rel, depth in r.deep_scripts:
+            h += f"<p>⚠️ depth {depth}: {rel}</p>"
+        h += "</div></div>"
+
+    # Wrong Python
+    if r.wrong_python:
+        h += '<div class="section"><h2>Wrong Python Version</h2><div class="content"><table><tr><th>Version</th><th>File</th></tr>'
+        for rel, ver in r.wrong_python:
+            h += f"<tr><td>{ver}</td><td>{rel}</td></tr>"
+        h += "</table></div></div>"
 
     # Resource types
-    if result["type_counts"]:
-        html += '<div class="section"><h2>Resource Type Distribution</h2><div class="content"><table><tr><th>Type</th><th>Count</th></tr>'
-        for tid, count in sorted(result["type_counts"].items(), key=lambda x: -x[1])[:15]:
-            html += f"<tr><td>{_type_name(tid)}</td><td>{count:,}</td></tr>"
-        if len(result["type_counts"]) > 15:
-            html += f"<tr><td colspan='2'>... and {len(result['type_counts']) - 15} more types</td></tr>"
-        html += "</table></div></div>"
+    if r.type_counts:
+        h += '<div class="section"><h2>Resource Distribution</h2><div class="content"><table><tr><th>Type</th><th>Count</th><th>Total Size</th></tr>'
+        for tid, count in sorted(r.type_counts.items(), key=lambda x: -x[1])[:15]:
+            h += f"<tr><td>{_type_name(tid)}</td><td>{count:,}</td><td></td></tr>"
+        h += "</table></div></div>"
 
-    # Duplicates
-    if result["duplicate_names"]:
-        html += '<div class="section"><h2>Duplicate File Names</h2><div class="content">'
-        for fp in result["duplicate_names"][:10]:
-            try:
-                rel = fp.relative_to(Path(result["mods_path"]))
-            except ValueError:
-                rel = fp
-            html += f"<p>{rel}</p>"
-        if len(result["duplicate_names"]) > 10:
-            html += f"<p>... and {len(result['duplicate_names']) - 10} more</p>"
-        html += "</div></div>"
+    # Top mods
+    if r.mod_resource_counts:
+        h += '<div class="section"><h2>Top Mods by Resources</h2><div class="content"><table><tr><th>Resources</th><th>Resource Size</th><th>File</th></tr>'
+        for rel, count in sorted(r.mod_resource_counts.items(), key=lambda x: -x[1])[:10]:
+            sz = r.mod_resource_sizes.get(rel, 0)
+            h += f"<tr><td>{count:,}</td><td>{_file_size_fmt(sz)}</td><td>{rel}</td></tr>"
+        h += "</table></div></div>"
 
-    if result["deep_scripts"]:
-        html += f'<div class="section"><h2>Scripts Too Deep (NEVER LOAD)</h2><div class="content">'
-        for rel, depth in result["deep_scripts"]:
-            html += f"<p>{'  ' * depth}{rel} (depth: {depth})</p>"
-        html += "</div></div>"
-
-    if result["wrong_python"]:
-        html += f'<div class="section"><h2>Wrong Python Version</h2><div class="content"><table><tr><th>File</th><th>Issue</th></tr>'
-        for rel, issue in result["wrong_python"]:
-            html += f"<tr><td>{rel}</td><td>{issue}</td></tr>"
-        html += "</table></div></div>"
-
-    html += """
+    h += f"""
 <div class="footer">
-  Generated by <b>Sims 4 Mod Analyzer</b> &mdash; 
-  <a href="https://github.com/vojust/sim4debug">github.com/vojust/sim4debug</a>
+  Generated by <b>Sims 4 Mod Analyzer {VERSION}</b>
 </div>
 </body></html>"""
-    return html
-
-
-# ── Text report ─────────────────────────────────────────────────────
-
-def print_report(result: dict):
-    if "error" in result:
-        print(f"\n  [ОШИБКА] {result['error']}")
-        return
-
-    mods_path = result["mods_path"]
-    total_mods = result["total_packages"] + result["total_scripts"]
-
-    print("=" * 64)
-    print(f"  Sims 4 Mod Analyzer — BetterExceptions Edition")
-    print(f"  Папка: {mods_path}")
-    print(f"  Время: {result['elapsed']:.1f}s")
-    print("=" * 64)
-
-    print(f"\n  📦 Всего модов:       {total_mods}")
-    print(f"  📦 Пакетов:           {result['total_packages']}")
-    print(f"  📜 Скрипт-модов:      {result['total_scripts']}")
-    print(f"  🧩 Всего ресурсов:    {result['total_entries']}")
-    print(f"  ⚠️  Конфликтов:       {result['total_conflicts']}")
-    if result["total_intentional"]:
-        print(f"     (из них intentional: {result['total_intentional']})")
-
-    # ── Health ──
-    if (result["onedrive"] or result["deep_scripts"] or result["corrupt_archives"]
-            or result["wrong_python"] or result["deprecated_files"]
-            or result["duplicate_content"]):
-        print(f"\n  {'─' * 60}")
-        print(f"  🔍 ЗДОРОВЬЕ МОДОВ")
-        print(f"  {'─' * 60}")
-
-        if result["onedrive"]:
-            print(f"\n    ❌ OneDrive активен — может восстанавливать удалённые моды")
-        if result["deep_scripts"]:
-            print(f"\n    ❌ Скрипты глубже 1 папки (НЕ ЗАГРУЗЯТСЯ):")
-            for rel, depth in result["deep_scripts"]:
-                print(f"       [depth {depth}] {rel}")
-        if result["corrupt_archives"]:
-            print(f"\n    ❌ Повреждённые .ts4script:")
-            for fp in result["corrupt_archives"][:5]:
-                try:
-                    rel = fp.relative_to(Path(mods_path))
-                except ValueError:
-                    rel = fp
-                print(f"       {rel}")
-        if result["wrong_python"]:
-            print(f"\n    ⚠️  Неправильная версия Python:")
-            for rel, issue in result["wrong_python"][:5]:
-                print(f"       {issue} — {rel}")
-        if result["deprecated_files"]:
-            print(f"\n    ⚠️  Неподходящие типы файлов в Mods:")
-            for fp in result["deprecated_files"][:5]:
-                try:
-                    rel = fp.relative_to(Path(mods_path))
-                except ValueError:
-                    rel = fp
-                print(f"       {rel}")
-        if result["duplicate_content"]:
-            print(f"\n    ⚠️  Полные дубликаты по содержимому:")
-            for a, b in result["duplicate_content"][:5]:
-                try:
-                    ra = a.relative_to(Path(mods_path))
-                except ValueError:
-                    ra = a
-                try:
-                    rb = b.relative_to(Path(mods_path))
-                except ValueError:
-                    rb = b
-                print(f"       {ra} == {rb}")
-
-    # ── Conflicts ──
-    if result["conflicts"]:
-        print(f"\n  {'─' * 60}")
-        print(f"  ⚠️  КОНФЛИКТЫ РЕСУРСОВ ({result['total_conflicts']})")
-        print(f"  {'─' * 60}")
-
-        by_type: dict[int, list] = defaultdict(list)
-        for c in result["conflicts"].values():
-            by_type[c["type"]].append(c)
-
-        for tid in sorted(by_type.keys()):
-            items = by_type[tid]
-            label = _type_name(tid)
-            print(f"\n    [{label}] — {len(items)} конфликт(ов)")
-            for c in items[:5]:
-                files_str = ", ".join(str(m[0]) for m in c["mods"])
-                intent = " (intentional)" if c.get("intentional") else ""
-                print(f"      Instance 0x{c['instance']:016X} → {files_str}{intent}")
-            if len(items) > 5:
-                print(f"      ... и ещё {len(items) - 5}")
-    else:
-        print(f"\n  ✅ Конфликтов ресурсов не найдено")
-
-    # ── Large files ──
-    if result["large_files"]:
-        print(f"\n  {'─' * 60}")
-        print(f"  🐘 БОЛЬШИЕ ФАЙЛЫ (>20 MB)")
-        print(f"  {'─' * 60}")
-        for rel, sz in result["large_files"][:10]:
-            mb = sz / (1024 * 1024)
-            print(f"    {mb:6.1f} MB  {rel}")
-        if len(result["large_files"]) > 10:
-            print(f"    ... и ещё {len(result['large_files']) - 10}")
-    else:
-        print(f"\n  ✅ Больших файлов не найдено")
-
-    # ── Script mods ──
-    if result["script_mods"]:
-        print(f"\n  {'─' * 60}")
-        print(f"  📜 ВСЕ СКРИПТ-МОДЫ ({len(result['script_mods'])})")
-        print(f"  {'─' * 60}")
-        for sp in result["script_mods"][:15]:
-            try:
-                rel = sp.relative_to(Path(mods_path))
-            except ValueError:
-                rel = sp
-            sz = sp.stat().st_size
-            kb = sz / 1024
-            print(f"    {kb:7.1f} KB  {rel}")
-        if len(result["script_mods"]) > 15:
-            print(f"    ... и ещё {len(result['script_mods']) - 15}")
-    else:
-        print(f"\n  ✅ Скрипт-модов не найдено")
-
-    # ── Duplicate names ──
-    if result["duplicate_names"]:
-        print(f"\n  {'─' * 60}")
-        print(f"  🔁 ДУБЛИКАТЫ ИМЁН ФАЙЛОВ")
-        print(f"  {'─' * 60}")
-        for fp in result["duplicate_names"][:10]:
-            try:
-                rel = fp.relative_to(Path(mods_path))
-            except ValueError:
-                rel = fp
-            print(f"    {rel}")
-        if len(result["duplicate_names"]) > 10:
-            print(f"    ... и ещё {len(result['duplicate_names']) - 10}")
-
-    # ── Top resource-heavy mods ──
-    if result["mod_resource_counts"]:
-        print(f"\n  {'─' * 60}")
-        print(f"  🏋️  ТОП-10 МОДОВ ПО КОЛИЧЕСТВУ РЕСУРСОВ")
-        print(f"  {'─' * 60}")
-        sorted_mods = sorted(
-            result["mod_resource_counts"].items(),
-            key=lambda x: -x[1],
-        )[:10]
-        for rel, count in sorted_mods:
-            print(f"    {count:6d} ресурсов  {rel}")
-
-    # ── Resource type distribution ──
-    if result["type_counts"]:
-        print(f"\n  {'─' * 60}")
-        print(f"  📊 РАСПРЕДЕЛЕНИЕ ПО ТИПАМ РЕСУРСОВ")
-        print(f"  {'─' * 60}")
-        for tid, count in sorted(result["type_counts"].items(), key=lambda x: -x[1])[:10]:
-            print(f"    {count:8,d}  {_type_name(tid)}")
-        if len(result["type_counts"]) > 10:
-            print(f"    ... и ещё {len(result['type_counts']) - 10} типов")
-
-    print(f"\n  {'=' * 64}")
-    print(f"  Анализ завершён.")
-    print(f"  {'=' * 64}\n")
+    return h
 
 
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main():
-    VERSION = "v26.622.1238"
-    html_output = False
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    parser = argparse.ArgumentParser(
+        prog="sim4debug",
+        description="Sims 4 Mod Analyzer — scan mods for conflicts, lag sources, and health issues",
+    )
+    parser.add_argument("path", nargs="?", help="Path to Mods folder")
+    parser.add_argument("--html", action="store_true", help="Generate HTML report")
+    parser.add_argument("--json", action="store_true", help="Output JSON report")
+    parser.add_argument("--color", action="store_true", default=None,
+                        help="Force colored terminal output")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--large", type=float, default=20, metavar="MB",
+                        help="Large file threshold in MB (default: 20)")
+    parser.add_argument("--max-depth", type=int, default=5, metavar="N",
+                        help="Max package folder depth (default: 5)")
+    parser.add_argument("--version", action="version", version=f"Sims 4 Mod Analyzer {VERSION}")
+    parser.add_argument("--output", "-o", type=str, metavar="FILE", help="Save report to file")
 
-    if "--version" in sys.argv:
-        print(f"Sims 4 Mod Analyzer {VERSION}")
-        return
-    if "--html" in sys.argv:
-        html_output = True
-    if "--help" in sys.argv:
-        print(f"Sims 4 Mod Analyzer {VERSION}")
-        print("Usage: python3 mod_analyzer.py [--html] [path]")
-        print("  --html    Generate HTML report (saved alongside text)")
-        print("  --version Show version")
-        print("  path      Mods folder path (skips interactive prompt)")
-        return
-        print("Usage: python3 mod_analyzer.py [--html] [path]")
-        print("  --html    Generate HTML report (saved alongside text)")
-        print("  path      Mods folder path (skips interactive prompt)")
-        return
+    args = parser.parse_args()
 
-    print()
-    print("  ╔══════════════════════════════════════════════╗")
-    print("  ║   Sims 4 Mod Analyzer — BE Edition v2.0     ║")
-    print("  ║  Поиск конфликтов и источников лагов        ║")
-    print("  ╚══════════════════════════════════════════════╝")
-    print()
+    color = args.color if args.color is not None else (not args.no_color)
+    if args.no_color:
+        color = False
 
-    paths_to_analyze: list[str] = []
-    if args:
-        paths_to_analyze = args
+    paths: list[str] = []
+    if args.path:
+        paths.append(args.path)
     else:
-        raw = input("  📂 Укажите путь к папке Mods: ").strip()
+        print(f"\n  {_c(_BOLD, f'Sims 4 Mod Analyzer {VERSION}', color)}")
+        raw = input("  📂 Path to Mods folder: ").strip()
         if raw:
-            paths_to_analyze.append(raw)
+            paths.append(raw)
+        else:
+            return
 
-    for p in paths_to_analyze:
+    for p in paths:
         path = Path(p).expanduser().resolve()
         if not path.is_dir():
-            print(f"  ❌ Папка не найдена: {path}\n")
+            print(_c(_RED, f"\n  ❌ Folder not found: {path}", color))
             continue
 
-        print(f"  🔍 Сканирую: {path}\n")
-        result = analyze(str(path))
-        print_report(result)
+        if not args.json:
+            print(f"\n  Scanning: {path}")
 
-        if html_output and "error" not in result:
-            html = _html_report(result)
-            out_path = Path("sims4_mod_report.html")
-            out_path.write_text(html, encoding="utf-8")
-            print(f"  📄 HTML-отчёт сохранён: {out_path.resolve()}")
+        _progress = None
+        if not args.json:
+            def _progress(n: int):
+                if n > 0 and n % 1000 == 0:
+                    print(f"\r  🔍 Scanning... {n} files", end="", flush=True)
+
+        result = analyze(str(path), large_mb=args.large, max_depth=args.max_depth,
+                         progress=_progress)
+        if not args.json:
+            print()
+
+        if args.json:
+            json_output = json.dumps(asdict(result), indent=2, default=str, ensure_ascii=False)
+            if args.output:
+                Path(args.output).write_text(json_output, encoding="utf-8")
+                print(f"  📄 JSON saved: {args.output}")
+            else:
+                print(json_output)
+        else:
+            print_report(result, color)
+
+            if args.html:
+                html = _html_report(result)
+                html_path = args.output + ".html" if args.output else "sims4_mod_report.html"
+                Path(html_path).write_text(html, encoding="utf-8")
+                print(f"  📄 HTML: {html_path.resolve()}")
+
+            if args.output:
+                out = Path(args.output)
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(f"Sims 4 Mod Analyzer {VERSION}\n")
+                    f.write(f"Path: {result.mods_path}\n")
+                    f.write(f"Time: {result.elapsed:.1f}s\n")
+                    f.write(f"Packages: {result.total_packages}, Scripts: {result.total_scripts}, "
+                            f"Conflicts: {result.total_conflicts}\n")
+                print(f"  📄 Report saved: {out.resolve()}")
 
         print()
 
