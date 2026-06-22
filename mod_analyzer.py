@@ -813,12 +813,22 @@ def print_report(result: dict):
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main():
+    VERSION = "v20260622.1238"
     html_output = False
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
+    if "--version" in sys.argv:
+        print(f"Sims 4 Mod Analyzer {VERSION}")
+        return
     if "--html" in sys.argv:
         html_output = True
     if "--help" in sys.argv:
+        print(f"Sims 4 Mod Analyzer {VERSION}")
+        print("Usage: python3 mod_analyzer.py [--html] [path]")
+        print("  --html    Generate HTML report (saved alongside text)")
+        print("  --version Show version")
+        print("  path      Mods folder path (skips interactive prompt)")
+        return
         print("Usage: python3 mod_analyzer.py [--html] [path]")
         print("  --html    Generate HTML report (saved alongside text)")
         print("  path      Mods folder path (skips interactive prompt)")
