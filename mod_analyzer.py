@@ -896,22 +896,24 @@ def main():
         else:
             print_report(result, color)
 
+            # Auto-save report
+            report_path = args.output if args.output else "sims4_mod_report.txt"
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(f"Sims 4 Mod Analyzer {VERSION}\n")
+                f.write(f"Path: {result.mods_path}\n")
+                f.write(f"Time: {result.elapsed:.1f}s\n")
+                f.write(f"Packages: {result.total_packages}, Scripts: {result.total_scripts}, "
+                        f"Conflicts: {result.total_conflicts}\n")
+            print(f"  📄 Report: {Path(report_path).resolve()}")
+
             if args.html:
                 html = _html_report(result)
-                html_path = args.output + ".html" if args.output else "sims4_mod_report.html"
+                html_path = (args.output + ".html") if args.output else "sims4_mod_report.html"
                 Path(html_path).write_text(html, encoding="utf-8")
-                print(f"  📄 HTML: {html_path.resolve()}")
+                print(f"  📄 HTML:   {Path(html_path).resolve()}")
 
-            if args.output:
-                out = Path(args.output)
-                with open(out, "w", encoding="utf-8") as f:
-                    f.write(f"Sims 4 Mod Analyzer {VERSION}\n")
-                    f.write(f"Path: {result.mods_path}\n")
-                    f.write(f"Time: {result.elapsed:.1f}s\n")
-                    f.write(f"Packages: {result.total_packages}, Scripts: {result.total_scripts}, "
-                            f"Conflicts: {result.total_conflicts}\n")
-                print(f"  📄 Report saved: {out.resolve()}")
-
+            print()
+            input("  Нажмите Enter для выхода...")
         print()
 
 
